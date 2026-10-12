@@ -287,7 +287,7 @@ function buildTrackedContent(p){
    if(!doc.querySelector('.page.study-active'))active.elements.forEach(el=>{el.style.display='block'});
    parent.postMessage({type:'cgpsc-question-nav',paperId:PAPER_ID,index:current,total:groups.length,number:active.number,out:!!active.out},'*');
   }
-  window.addEventListener('message',e=>{const d=e.data;if(!d||d.paperId!==PAPER_ID)return;if(d.type==='cgpsc-show-question')show(d.index)});
+  window.addEventListener('message',e=>{const d=e.data;if(!d||d.paperId!==PAPER_ID)return;if(d.type==='cgpsc-show-question')show(d.index);else if(d.type==='cgpsc-reload-question-progress'&&d.progress){groups.forEach(g=>{const done=!!d.progress[g.key];g.elements.forEach(el=>{const cb=el.querySelector('.question-track-control input'),label=el.querySelector('.question-track-control'),caption=el.querySelector('.question-track-control span');if(cb){cb.checked=done;label.classList.toggle('is-done',done);caption.textContent=done?'✓ Question done':'Mark question done'}})});}});
   show(0);parent.postMessage({type:'cgpsc-question-count',paperId:PAPER_ID,total:groups.length,done:groups.filter(g=>!!DONE[g.key]).length},'*');
  }
  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',setup);else setup();
@@ -330,15 +330,16 @@ document.getElementById('trClose').onclick=function(){P.classList.remove('show')
   'use strict';
   const SUPABASE_URL = 'https://hvhevtkpnkurxlbxxcyi.supabase.co';
   const SUPABASE_ANON_KEY = 'sb_publishable_AH9LCWBSJLFFqKPW6ZS5VA_UckytfFh';
-  // Keep this identifier unchanged in every copy/device of this personal app.
+  // This ID must match the SQL policy and remain identical on every device.
   const SYNC_ID = 'cgpsc-personal-sync-8c1f7a2e-64b9-4d31-a702-91d3e85f6c42';
   const TABLE = 'study_progress_shared';
   const statusEl = document.getElementById('cloudSyncStatus');
   const syncBtn = document.getElementById('cloudSyncNowBtn');
-  let client = null, syncTimer = null, syncing = false, applyingRemote = false, pendingPush = false;
-  const status = message => { statusEl.textContent = message; };
+  let client = null, syncTimer = null, syncing = false, pushing = false;
+  let applyingRemote = false, pendingPush = false, lastLocalChangeAt = 0;
+  const status = message => { if (statusEl) statusEl.textContent = message; };
   if (!window.supabase || !window.supabase.createClient) {
-    status('Could not load cloud sync. Check your internet connection and reload.');
+    status('Cloud sync library did not load. Check internet and reload.');
     return;
   }
   client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -372,48 +373,61 @@ document.getElementById('trClose').onclick=function(){P.classList.remove('show')
       if (typeof render === 'function') render();
       if (typeof updateViewerButtons === 'function') updateViewerButtons();
       if (typeof updateQuestionProgress === 'function') updateQuestionProgress();
+      // Refresh the visible question checkbox state if a paper is currently open.
+      const frame = document.getElementById('paperFrame');
+      if (frame && frame.contentWindow && activePaperId) {
+        const p = papers.find(x => x.id === activePaperId);
+        if (p) frame.contentWindow.postMessage({type:'cgpsc-reload-question-progress',paperId:p.id,progress:p.questionProgress||{}}, '*');
+      }
     } finally { applyingRemote = false; }
   };
   async function pushProgress() {
     if (applyingRemote) { pendingPush = true; return; }
+    if (pushing || syncing) { pendingPush = true; return; }
+    pushing = true;
     try {
-      status('Saving progress to the cloud…');
+      status('Saving your question progress to the cloud…');
       const row = { sync_id: SYNC_ID, progress: getProgress(), updated_at: new Date().toISOString() };
       const { error } = await client.from(TABLE).upsert(row, { onConflict: 'sync_id' });
       if (error) throw error;
-      status('Progress synced across your devices · ' + new Date().toLocaleTimeString());
+      status('Synced across devices · ' + new Date().toLocaleTimeString());
     } catch (e) {
-      status('Cloud sync setup needed: ' + (e.message || 'check the table and access policies.'));
+      status('Sync failed: ' + (e.message || 'check the Supabase table and policies.'));
+    } finally {
+      pushing = false;
+      if (pendingPush) { pendingPush = false; clearTimeout(syncTimer); syncTimer = setTimeout(pushProgress, 250); }
     }
   }
-  async function pullProgress() {
-    if (syncing) return;
+  async function pullProgress(force) {
+    if (syncing || pushing) return;
+    // Avoid pulling an older cloud snapshot while a local checkbox change is waiting to upload.
+    if (!force && Date.now() - lastLocalChangeAt < 1800) return;
     syncing = true;
-    syncBtn.disabled = true;
-    status('Checking for your latest saved progress…');
+    if (syncBtn) syncBtn.disabled = true;
     try {
       const { data, error } = await client.from(TABLE).select('progress,updated_at').eq('sync_id', SYNC_ID).maybeSingle();
       if (error) throw error;
       if (data && data.progress) {
         applyProgress(data.progress);
-        status('Progress synced across your devices · ' + new Date(data.updated_at).toLocaleString());
+        status('Progress up to date · ' + new Date(data.updated_at).toLocaleTimeString());
       } else {
-        status('First sync: uploading this device’s current progress…');
-        await pushProgress();
+        status('Uploading this device’s current progress for the first time…');
+        pendingPush = true;
       }
     } catch (e) {
-      status('Cloud sync setup needed: ' + (e.message || 'run the SQL setup provided with this app.'));
+      status('Sync failed: ' + (e.message || 'check the table and policies.'));
     } finally {
       syncing = false;
-      syncBtn.disabled = false;
+      if (syncBtn) syncBtn.disabled = false;
       if (pendingPush) { pendingPush = false; await pushProgress(); }
     }
   }
   function queueSync() {
     if (applyingRemote) return;
+    lastLocalChangeAt = Date.now();
     clearTimeout(syncTimer);
-    status('Progress changed · syncing shortly…');
-    syncTimer = setTimeout(pushProgress, 800);
+    status('Question progress changed · syncing…');
+    syncTimer = setTimeout(pushProgress, 500);
   }
   const originalSave = save;
   save = function() {
@@ -421,9 +435,12 @@ document.getElementById('trClose').onclick=function(){P.classList.remove('show')
     if (ok) queueSync();
     return ok;
   };
-  syncBtn.addEventListener('click', pullProgress);
-  // Automatically pull cloud progress whenever this app opens.
-  pullProgress();
+  if (syncBtn) syncBtn.addEventListener('click', () => pullProgress(true));
+  // Polling keeps already-open devices in sync even when Supabase Realtime is not enabled.
+  pullProgress(true);
+  setInterval(() => pullProgress(false), 7000);
+  window.addEventListener('focus', () => pullProgress(false));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pullProgress(false); });
 })();
 </script>
 
